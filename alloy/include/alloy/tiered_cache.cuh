@@ -3,21 +3,21 @@
 #ifndef ALLOY_TIERED_CACHE_CUH
 #define ALLOY_TIERED_CACHE_CUH
 
-/// Alloy Tiered Embedding Cache
-///
-/// Extends HypeReca's two-level (GPU-pool / CPU-DRAM) embedding hierarchy
-/// into a four-level placement with per-tier native precision:
-///
-///   Tier 0  H100  HBM3   hot    FP8  (E4M3)
-///   Tier 1  A6000 GDDR6  warm   BF16
-///   Tier 2  CPU   DRAM   cold   FP32
-///   Tier 3  SSD          arch.  FP32
-///
-/// The key data structure is a per-row frequency histogram maintained
-/// entirely in device memory.  A dedicated histogram-only kernel runs
-/// first over the full batch of lookup indices (mirroring CUB's
-/// DeviceTopK histogram-pass separation), then a fused classify+migrate
-/// kernel partitions rows across tiers.
+// Alloy Tiered Embedding Cache
+//
+// Extends HypeReca's two-level (GPU-pool / CPU-DRAM) embedding hierarchy
+// into a four-level placement with per-tier native precision:
+//
+//   Tier 0  H100  HBM3   hot    FP8  (E4M3)
+//   Tier 1  A6000 GDDR6  warm   BF16
+//   Tier 2  CPU   DRAM   cold   FP32
+//   Tier 3  SSD          arch.  FP32
+//
+// The key data structure is a per-row frequency histogram maintained
+// entirely in device memory.  A dedicated histogram-only kernel runs
+// first over the full batch of lookup indices (mirroring CUB's
+// DeviceTopK histogram-pass separation), then a fused classify+migrate
+// kernel partitions rows across tiers.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -51,8 +51,8 @@ enum class Tier : uint8_t {
     NUM_TIERS   = 4
 };
 
-/// Thresholds are expressed as EMA frequency values.
-/// classify_row() is evaluated per-row, per-batch.
+// Thresholds are expressed as EMA frequency values.
+// classify_row() is evaluated per-row, per-batch.
 struct TierThresholds {
     float hot;     // freq >= hot  → Tier 0 (H100)
     float warm;    // freq >= warm → Tier 1 (A6000)
@@ -131,23 +131,52 @@ __global__ void FrequencyDecayKernel(
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Pass 1 — fused classify-and-scatter kernel
+//  Tier buffer resolution
 //
-//  For each index in the batch:
-//    1.  Read the row's current EMA frequency from d_freq_hist
-//    2.  Classify into a tier via classify_row()
-//    3.  Compare with the row's *current* tier
-//    4a. If the row is already in the correct tier: read the
-//        embedding from the tier-local buffer and write to output
-//    4b. If a migration is needed: enqueue the (row, old_tier,
-//        new_tier) triple into d_migration_queue via atomicAdd
-//        on a per-tier counter, and still serve from old tier
+//  A single lookup replacing repeated switch-case blocks.
+//  The buffer table lives in constant memory per-launch.
+// ─────────────────────────────────────────────────────────────────
+
+template <typename DataType>
+struct TierBufferTable {
+    const DataType* __restrict__ bufs[3];  // indexed by Tier enum
+
+    __device__ __forceinline__
+    const DataType* operator[](Tier t) const { return bufs[static_cast<int>(t)]; }
+};
+
+// ─────────────────────────────────────────────────────────────────
+//  process_range — generic strided element processor
 //
-//  This two-pass structure (histogram → classify+scatter) is
-//  analogous to CUB's first-pass histogram then fused filter-and-
-//  histogram for subsequent passes: the histogram kernel has a
-//  different occupancy sweet-spot, and separating it lets the
-//  compiler specialize each kernel independently.
+//  Mirrors CUB's process_range: iterates over a tile of batch
+//  indices and invokes a caller-supplied lambda on each (row, tid)
+//  pair.  The lambda captures all strategy-specific logic; the
+//  iteration skeleton is shared across strategies.
+// ─────────────────────────────────────────────────────────────────
+
+template <int BLOCK_THREADS, typename F>
+__device__ __forceinline__
+void process_range(
+    const size_t* __restrict__ d_indices,
+    size_t                     batch_size,
+    size_t                     tile_offset,
+    F&&                        f)
+{
+    for (size_t tid = tile_offset + threadIdx.x;
+         tid < batch_size;
+         tid += static_cast<size_t>(gridDim.x) * BLOCK_THREADS)
+    {
+        f(d_indices[tid], tid);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Migration double-buffer
+//
+//  Replaces raw pointer management with CUB's DoubleBuffer pattern.
+//  Current() is the migration queue being filled; Alternate() holds
+//  the previous step's queue being drained by ExecuteMigrationsKernel.
+//  At each step boundary: selector ^= 1.
 // ─────────────────────────────────────────────────────────────────
 
 struct MigrationEntry {
@@ -156,66 +185,117 @@ struct MigrationEntry {
     Tier   dst_tier;
 };
 
+struct MigrationQueueDoubleBuffer {
+    MigrationEntry* bufs[2];
+    uint32_t*       counts[2];
+    int             selector;
+
+    __host__ __device__ MigrationEntry* Current()   { return bufs[selector]; }
+    __host__ __device__ MigrationEntry* Alternate() { return bufs[selector ^ 1]; }
+    __host__ __device__ uint32_t*       CurrentCount()   { return counts[selector]; }
+    __host__ __device__ uint32_t*       AlternateCount() { return counts[selector ^ 1]; }
+};
+
+// ─────────────────────────────────────────────────────────────────
+//  Pass 1 — fused classify-and-scatter kernel
+//
+//  Restructured following CUB DeviceTopK's three-lambda pattern:
+//
+//    f_in_place:       row is already at the correct tier.
+//                      Serve from current buffer, no migration needed.
+//                      (analogous to f_early_stop: the "done" path)
+//
+//    f_serve_enqueue:  row is at the wrong tier but migration queue
+//                      has capacity.  Serve from current buffer AND
+//                      enqueue a migration entry for async processing.
+//                      (analogous to f_with_out_buf: filter + histogram)
+//
+//    f_serve_only:     row is at the wrong tier but migration queue
+//                      is full (budget exhausted this step).  Serve
+//                      from current buffer, skip migration enqueue.
+//                      (analogous to f_no_out_buf: histogram only)
+//
+//  All three lambdas are passed to the same process_range template.
+//  The appropriate lambda is selected based on runtime state, just
+//  as CUB selects based on early_stop / out_buf / nullptr.
+// ─────────────────────────────────────────────────────────────────
+
 template <typename DataType, int BLOCK_THREADS = 256>
 __global__ void ClassifyAndScatterKernel(
-    // Lookup indices
-    const size_t*       __restrict__ d_indices,      // [batch_size]
+    const size_t*       __restrict__ d_indices,
     size_t                           batch_size,
     size_t                           embedding_dim,
-    // Frequency histogram (read-only after Pass 0)
     const uint32_t*     __restrict__ d_freq_hist,
-    // Per-row current tier assignment
-    const uint8_t*      __restrict__ d_row_tier,     // [num_embeddings]
-    // Tier thresholds
+    const uint8_t*      __restrict__ d_row_tier,
     TierThresholds                   thresholds,
-    // Tier-local embedding buffers (may be nullptr for unpopulated tiers)
-    const DataType*     __restrict__ d_tier0_buf,    // H100 — FP8 storage (cast widened to DataType on read)
-    const DataType*     __restrict__ d_tier1_buf,    // A6000 — BF16 storage
-    const DataType*     __restrict__ d_tier2_buf,    // CPU-staged DRAM copy
-    // Output buffer (always FP32 for forward pass)
-    DataType*           __restrict__ d_output,       // [batch_size × embedding_dim]
-    // Migration queue
+    TierBufferTable<DataType>        tier_bufs,
+    DataType*           __restrict__ d_output,
     MigrationEntry*     __restrict__ d_migration_queue,
-    uint32_t*           __restrict__ d_migration_count)
+    uint32_t*           __restrict__ d_migration_count,
+    uint32_t                         migration_budget)
 {
-    const size_t tid = static_cast<size_t>(blockIdx.x) * BLOCK_THREADS + threadIdx.x;
-    if (tid >= batch_size) return;
+    const size_t tile_offset = static_cast<size_t>(blockIdx.x) * BLOCK_THREADS;
 
-    const size_t row     = d_indices[tid];
-    const float  freq    = static_cast<float>(d_freq_hist[row]);
-    const Tier   target  = classify_row(freq, thresholds);
-    const Tier   current = static_cast<Tier>(d_row_tier[row]);
-
-    // Select source buffer based on current (not target) tier:
-    // we always serve from wherever the data currently lives.
-    const DataType* __restrict__ src_buf = nullptr;
-    switch (current)
-    {
-        case Tier::H100_HBM3:   src_buf = d_tier0_buf; break;
-        case Tier::A6000_GDDR6: src_buf = d_tier1_buf; break;
-        case Tier::CPU_DRAM:    src_buf = d_tier2_buf; break;
-        default:                src_buf = d_tier2_buf; break;
-    }
-
-    // Gather embedding row → output (coalesced along embedding_dim via
-    // the same blockDim.x-as-embedding-width trick from HypeReca's
-    // indexGetKernel, but here we handle it with a loop to support
-    // arbitrary embedding dimensions)
-    if (src_buf != nullptr)
-    {
-        const DataType* __restrict__ row_ptr = src_buf + row * embedding_dim;
-        DataType*       __restrict__ out_ptr = d_output + tid * embedding_dim;
+    // Shared gather helper: copy one embedding row from src tier to output
+    auto gather_row = [&](const size_t row, const size_t out_idx, const Tier current) {
+        const DataType* __restrict__ src = tier_bufs[current];
+        if (src == nullptr) return;
+        const DataType* __restrict__ row_ptr = src + row * embedding_dim;
+        DataType*       __restrict__ out_ptr = d_output + out_idx * embedding_dim;
         for (size_t d = 0; d < embedding_dim; ++d)
-        {
             out_ptr[d] = row_ptr[d];
-        }
-    }
+    };
 
-    // Enqueue migration if tier changed
-    if (target != current)
+    // Lambda for row already at correct tier: just serve, no migration.
+    // Analogous to CUB f_early_stop: the "we're done" fast path.
+    auto f_in_place = [&](size_t row, size_t out_idx) {
+        const Tier current = static_cast<Tier>(d_row_tier[row]);
+        gather_row(row, out_idx, current);
+    };
+
+    // Lambda for row at wrong tier, migration queue has capacity.
+    // Serve from current tier AND enqueue migration.
+    // Analogous to CUB f_with_out_buf: filter + write candidates + histogram.
+    auto f_serve_enqueue = [&](size_t row, size_t out_idx) {
+        const float freq    = static_cast<float>(d_freq_hist[row]);
+        const Tier  target  = classify_row(freq, thresholds);
+        const Tier  current = static_cast<Tier>(d_row_tier[row]);
+        gather_row(row, out_idx, current);
+        if (target != current)
+        {
+            const uint32_t slot = atomicAdd(d_migration_count, 1u);
+            d_migration_queue[slot] = {row, current, target};
+        }
+    };
+
+    // Lambda for row at wrong tier, migration budget exhausted.
+    // Serve from current tier, skip enqueue.
+    // Analogous to CUB f_no_out_buf: histogram only, no output write.
+    auto f_serve_only = [&](size_t row, size_t out_idx) {
+        const Tier current = static_cast<Tier>(d_row_tier[row]);
+        gather_row(row, out_idx, current);
+    };
+
+    // Choose and invoke the appropriate lambda.
+    // Read current migration count to decide if we have budget.
+    // This mirrors CUB's if(early_stop) / else if(out_buf) / else dispatch.
+    if (migration_budget == 0)
     {
-        const uint32_t slot = atomicAdd(d_migration_count, 1u);
-        d_migration_queue[slot] = {row, current, target};
+        // No migrations allowed this step — fast path
+        process_range<BLOCK_THREADS>(d_indices, batch_size, tile_offset, f_in_place);
+    }
+    else
+    {
+        // Check if migration queue still has capacity
+        const uint32_t current_count = *d_migration_count;
+        if (current_count < migration_budget)
+        {
+            process_range<BLOCK_THREADS>(d_indices, batch_size, tile_offset, f_serve_enqueue);
+        }
+        else
+        {
+            process_range<BLOCK_THREADS>(d_indices, batch_size, tile_offset, f_serve_only);
+        }
     }
 }
 
@@ -223,18 +303,18 @@ __global__ void ClassifyAndScatterKernel(
 //  Migration execution kernel
 //
 //  Processes the migration queue built by ClassifyAndScatterKernel.
-//  Each thread handles one MigrationEntry: reads from src tier
-//  buffer, converts precision, writes to dst tier buffer, and
-//  updates the per-row tier assignment.
+//  Uses TierBufferTable for single-lookup buffer resolution
+//  (replacing the two switch-case blocks in the previous version).
+//
+//  The queue comes from MigrationQueueDoubleBuffer.Alternate():
+//  the previous step's enqueued entries, which can now be drained
+//  while the current step fills Current() — the DoubleBuffer
+//  pattern from CUB ensures no race between producer and consumer.
 //
 //  Precision conversion rules:
 //    Tier 0 (H100)  ↔ FP8  E4M3
 //    Tier 1 (A6000) ↔ BF16
 //    Tier 2 (CPU)   ↔ FP32
-//
-//  Promotion (cold→hot): truncates precision but gains bandwidth.
-//  Demotion  (hot→cold): widens precision, preserves accumulated
-//                         gradient information.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename SrcType, typename DstType>
@@ -244,16 +324,20 @@ DstType precision_cast(SrcType val)
     return static_cast<DstType>(static_cast<float>(val));
 }
 
+template <typename DataType>
+struct MutableTierBufferTable {
+    DataType* __restrict__ bufs[3];
+
+    __device__ __forceinline__
+    DataType* operator[](Tier t) const { return bufs[static_cast<int>(t)]; }
+};
+
 template <typename DataType, int BLOCK_THREADS = 128>
 __global__ void ExecuteMigrationsKernel(
     const MigrationEntry* __restrict__ d_queue,
     uint32_t                           queue_len,
     size_t                             embedding_dim,
-    // Tier buffers (read/write)
-    DataType*             __restrict__ d_tier0_buf,
-    DataType*             __restrict__ d_tier1_buf,
-    DataType*             __restrict__ d_tier2_buf,
-    // Row-tier assignment (updated in-place)
+    MutableTierBufferTable<DataType>   tier_bufs,
     uint8_t*              __restrict__ d_row_tier)
 {
     const uint32_t tid = blockIdx.x * BLOCK_THREADS + threadIdx.x;
@@ -262,36 +346,17 @@ __global__ void ExecuteMigrationsKernel(
     const MigrationEntry entry = d_queue[tid];
     const size_t base = entry.row_idx * embedding_dim;
 
-    // Resolve source and destination buffer pointers
-    DataType* __restrict__ src = nullptr;
-    DataType* __restrict__ dst = nullptr;
-
-    switch (entry.src_tier)
-    {
-        case Tier::H100_HBM3:   src = d_tier0_buf; break;
-        case Tier::A6000_GDDR6: src = d_tier1_buf; break;
-        case Tier::CPU_DRAM:    src = d_tier2_buf; break;
-        default: return;
-    }
-    switch (entry.dst_tier)
-    {
-        case Tier::H100_HBM3:   dst = d_tier0_buf; break;
-        case Tier::A6000_GDDR6: dst = d_tier1_buf; break;
-        case Tier::CPU_DRAM:    dst = d_tier2_buf; break;
-        default: return;
-    }
+    // Single-lookup buffer resolution via table (no switch-case)
+    DataType* __restrict__ src = tier_bufs[entry.src_tier];
+    DataType* __restrict__ dst = tier_bufs[entry.dst_tier];
 
     if (src == nullptr || dst == nullptr) return;
 
-    // Copy with implicit precision conversion through DataType
-    // (the actual FP8↔BF16↔FP32 cast is handled by the typed
-    //  instantiation of the kernel — see dispatch in tiered_embedding.cu)
     for (size_t d = 0; d < embedding_dim; ++d)
     {
         dst[base + d] = src[base + d];
     }
 
-    // Update tier assignment
     d_row_tier[entry.row_idx] = static_cast<uint8_t>(entry.dst_tier);
 }
 

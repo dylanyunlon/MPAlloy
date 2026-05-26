@@ -3,24 +3,24 @@
 #ifndef ALLOY_ELASTIC_MIGRATE_CUH
 #define ALLOY_ELASTIC_MIGRATE_CUH
 
-/// Alloy Elastic Migration Engine
-///
-/// Adapts mTuner's four-operation model to the tiered embedding cache:
-///
-///   gather     pull hot rows from lower tier to higher tier
-///   discard    evict cold rows from higher tier to lower tier
-///   execute    compute on rows at their current location
-///   checkpoint save dirty rows to CPU DRAM for fault tolerance
-///
-/// The key difference from mTuner's original design (which manages
-/// full tensors) is that Alloy operates on *row ranges* within a
-/// shared embedding table.  A single table can have hot rows on
-/// H100, warm rows on A6000, and cold rows on CPU simultaneously.
-///
-/// Migration is PCIe-aware: gather/discard operations are batched
-/// into PCIe-Gen-sized transfers to amortise per-transfer overhead.
-/// The DoubleBuffer pattern (from CUB) is used to overlap migration
-/// of batch N with training on batch N-1.
+// Alloy Elastic Migration Engine
+//
+// Adapts mTuner's four-operation model to the tiered embedding cache:
+//
+//   gather     pull hot rows from lower tier to higher tier
+//   discard    evict cold rows from higher tier to lower tier
+//   execute    compute on rows at their current location
+//   checkpoint save dirty rows to CPU DRAM for fault tolerance
+//
+// The key difference from mTuner's original design (which manages
+// full tensors) is that Alloy operates on *row ranges* within a
+// shared embedding table.  A single table can have hot rows on
+// H100, warm rows on A6000, and cold rows on CPU simultaneously.
+//
+// Migration is PCIe-aware: gather/discard operations are batched
+// into PCIe-Gen-sized transfers to amortise per-transfer overhead.
+// The DoubleBuffer pattern (from CUB) is used to overlap migration
+// of batch N with training on batch N-1.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -240,7 +240,7 @@ __global__ void CheckpointCompactKernel(
     }
 }
 
-/// Reset dirty flags after checkpoint
+// Reset dirty flags after checkpoint
 __global__ void ClearDirtyFlagsKernel(
     uint8_t* __restrict__ d_dirty_flags,
     size_t                num_rows)

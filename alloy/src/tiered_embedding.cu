@@ -83,9 +83,9 @@ public:
 
     // ── Main training-step pipeline ─────────────────────────────
 
-    /// Called once per batch.  Runs the two-pass lookup:
-    ///   Pass 0: histogram over indices
-    ///   Pass 1: classify + scatter (with migration enqueue)
+    // Called once per batch.  Runs the two-pass lookup:
+    //   Pass 0: histogram over indices
+    //   Pass 1: classify + scatter (with migration enqueue)
     void lookup(
         const size_t* d_indices,
         size_t        batch_size,
@@ -132,8 +132,8 @@ public:
         ++step_;
     }
 
-    /// Process pending migrations (call between forward and backward).
-    /// Caps migration count per step to avoid PCIe saturation.
+    // Process pending migrations (call between forward and backward).
+    // Caps migration count per step to avoid PCIe saturation.
     void process_migrations(cudaStream_t stream)
     {
         uint32_t queue_len = 0;
@@ -160,8 +160,8 @@ public:
             d_row_tier_);
     }
 
-    /// Cross-precision gradient allreduce.
-    /// Called after backward pass has accumulated per-tier gradients.
+    // Cross-precision gradient allreduce.
+    // Called after backward pass has accumulated per-tier gradients.
     void allreduce_gradients(
         float*       d_grad_accum, // [num_embeddings × dim] — FP32 accumulator
         cudaStream_t stream)
@@ -195,8 +195,8 @@ public:
         }
     }
 
-    /// Periodic drift verification using FPRev diagnostic batches.
-    /// Returns (max_abs_drift, max_rel_drift).
+    // Periodic drift verification using FPRev diagnostic batches.
+    // Returns (max_abs_drift, max_rel_drift).
     std::pair<float, float> verify_drift(cudaStream_t stream)
     {
         const size_t diag_batch = 256;

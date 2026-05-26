@@ -3,21 +3,21 @@
 #ifndef ALLOY_MIXED_PRECISION_KERNELS_CUH
 #define ALLOY_MIXED_PRECISION_KERNELS_CUH
 
-/// Alloy Mixed-Precision Gradient Aggregation
-///
-/// The core numerical problem: when H100 accumulates gradients in FP8,
-/// A6000 in BF16, and CPU in FP32, the allreduce produces different
-/// bit-patterns depending on reduction order and intermediate precision.
-///
-/// This module implements:
-///   1. Per-tier gradient accumulation kernels with configurable precision
-///   2. A cross-precision allreduce that upcasts to FP32 before summing
-///   3. FPRev-style diagnostic batch generation for drift detection
-///
-/// The "distinguishing input" technique (from FPRev) constructs gradients
-/// near precision boundaries — FP8 max (448), subnormal zones, and
-/// catastrophic cancellation pairs — to maximise observable divergence
-/// between precision paths.
+// Alloy Mixed-Precision Gradient Aggregation
+//
+// The core numerical problem: when H100 accumulates gradients in FP8,
+// A6000 in BF16, and CPU in FP32, the allreduce produces different
+// bit-patterns depending on reduction order and intermediate precision.
+//
+// This module implements:
+//   1. Per-tier gradient accumulation kernels with configurable precision
+//   2. A cross-precision allreduce that upcasts to FP32 before summing
+//   3. FPRev-style diagnostic batch generation for drift detection
+//
+// The "distinguishing input" technique (from FPRev) constructs gradients
+// near precision boundaries — FP8 max (448), subnormal zones, and
+// catastrophic cancellation pairs — to maximise observable divergence
+// between precision paths.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -245,9 +245,9 @@ __global__ void GenerateDiagnosticGradients(
     }
 }
 
-/// Computes max |a - b| and max |a - b| / max(|a|, ε) element-wise
-/// between two gradient buffers.  The output is a single (abs, rel) pair
-/// reduced via shared memory.
+// Computes max |a - b| and max |a - b| / max(|a|, ε) element-wise
+// between two gradient buffers.  The output is a single (abs, rel) pair
+// reduced via shared memory.
 __global__ void MeasureDriftKernel(
     const float* __restrict__ d_ref,     // FP32 reference
     const float* __restrict__ d_test,    // round-tripped through narrow precision
