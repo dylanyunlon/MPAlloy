@@ -1,0 +1,180 @@
+diff --git a/HugeCTR/include/common.hpp b/HugeCTR/include/common.hpp
+index 02bb23d8..176f04b1 100644
+--- a/HugeCTR/include/common.hpp
++++ b/HugeCTR/include/common.hpp
+@@ -16,6 +16,14 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++
++inline double getDuration(std::chrono::time_point<std::chrono::system_clock> a,
++        std::chrono::time_point<std::chrono::system_clock> b) {
++    return  std::chrono::duration<double>(b - a).count();
++}
++
++#define timestamp(__var__) cudaDeviceSynchronize(); auto __var__ = std::chrono::system_clock::now();
+ #include <assert.h>
+ #include <cublas_v2.h>
+ #include <ctime>
+@@ -143,7 +151,8 @@ enum class Layer_t {
+ enum class Embedding_t {
+   DistributedSlotSparseEmbeddingHash,
+   LocalizedSlotSparseEmbeddingHash,
+-  LocalizedSlotSparseEmbeddingOneHot
++  LocalizedSlotSparseEmbeddingOneHot,
++  DressEmbedding
+ };
+ 
+ enum class Initializer_t { Default, Uniform, XavierNorm, XavierUniform, Zero };
+@@ -189,6 +198,16 @@ typedef struct DataSetHeader_ {
+     std::cerr << "[HCDEBUG][ERROR] " << str << " " << __FILE__ << ":" << __LINE__             \
+               << " in pid: " << __PID << " of " << __NUM_PROCS << " processes." << std::endl; \
+   } while (0)
++
++
++#define REPORT_TIME_(_name, _t0, _t1) { \
++    int __PID(-1); \
++    MPI_Comm_rank(MPI_COMM_WORLD, &__PID);                                                    \
++    if (__PID == 0) { \
++        std::cerr << "Timespan " << (_name) << " is " << getDuration(_t0, _t1) \
++            << " s\n"; \
++    } \
++}
+ #else
+ #define ERROR_MESSAGE_(msg)                                                                     \
+   do {                                                                                          \
+diff --git a/HugeCTR/include/embedding.hpp b/HugeCTR/include/embedding.hpp
+index be9d8935..aee9c532 100644
+--- a/HugeCTR/include/embedding.hpp
++++ b/HugeCTR/include/embedding.hpp
+@@ -323,6 +323,24 @@ struct EmbeddingCreator {
+       SparseEmbeddingHashParams<float> embedding_params, const std::string plan_file,
+       const std::shared_ptr<GPUResourceGroup>& gpu_resource_group);
+ 
++  // dress
++  static Embedding<TYPE_1, float>* create_dress_embedding(
++      const Tensors<TYPE_1>& row_offsets_tensors, const Tensors<TYPE_1>& value_tensors,
++      SparseEmbeddingHashParams<float> embedding_params,
++      const std::shared_ptr<GPUResourceGroup>& gpu_resource_group);
++  static Embedding<TYPE_2, float>* create_dress_embedding(
++      const Tensors<TYPE_2>& row_offsets_tensors, const Tensors<TYPE_2>& value_tensors,
++      SparseEmbeddingHashParams<float> embedding_params,
++      const std::shared_ptr<GPUResourceGroup>& gpu_resource_group);
++  static Embedding<TYPE_1, __half>* create_dress_embedding(
++      const Tensors<TYPE_1>& row_offsets_tensors, const Tensors<TYPE_1>& value_tensors,
++      SparseEmbeddingHashParams<__half> embedding_params,
++      const std::shared_ptr<GPUResourceGroup>& gpu_resource_group);
++  static Embedding<TYPE_2, __half>* create_dress_embedding(
++      const Tensors<TYPE_2>& row_offsets_tensors, const Tensors<TYPE_2>& value_tensors,
++      SparseEmbeddingHashParams<__half> embedding_params,
++      const std::shared_ptr<GPUResourceGroup>& gpu_resource_group);
++
+   static Embedding<TYPE_1, __half>* create_localized_sparse_embedding_one_hot(
+       const Tensors<TYPE_1>& row_offsets_tensors, const Tensors<TYPE_1>& value_tensors,
+       SparseEmbeddingHashParams<__half> embedding_params, const std::string plan_file,
+diff --git a/HugeCTR/src/embedding_creator.cu b/HugeCTR/src/embedding_creator.cu
+index 87316bda..5c1207c9 100644
+--- a/HugeCTR/src/embedding_creator.cu
++++ b/HugeCTR/src/embedding_creator.cu
+@@ -18,6 +18,7 @@
+ #include "HugeCTR/include/embeddings/distributed_slot_sparse_embedding_hash.hpp"
+ #include "HugeCTR/include/embeddings/localized_slot_sparse_embedding_hash.hpp"
+ #include "HugeCTR/include/embeddings/localized_slot_sparse_embedding_one_hot.hpp"
++#include "HugeCTR/include/embeddings/dress_embedding.hpp"
+ 
+ namespace HugeCTR {
+ 
+@@ -129,6 +130,44 @@ EmbeddingCreator::create_localized_sparse_embedding_one_hot(
+   return sparse_embedding;
+ }
+ 
++Embedding<EmbeddingCreator::TYPE_1, float>*
++EmbeddingCreator::create_dress_embedding(
++    const Tensors<TYPE_1>& row_offsets_tensors, const Tensors<TYPE_1>& value_tensors,
++    SparseEmbeddingHashParams<float> embedding_params,
++    const std::shared_ptr<GPUResourceGroup>& gpu_resource_group) {
++  Embedding<TYPE_1, float>* sparse_embedding =
++      new DressEmbedding<TYPE_1, float>(
++          row_offsets_tensors, value_tensors, embedding_params, gpu_resource_group);
++  return sparse_embedding;
++}
++
++Embedding<EmbeddingCreator::TYPE_2, float>*
++EmbeddingCreator::create_dress_embedding(
++    const Tensors<TYPE_2>& row_offsets_tensors, const Tensors<TYPE_2>& value_tensors,
++    SparseEmbeddingHashParams<float> embedding_params,
++    const std::shared_ptr<GPUResourceGroup>& gpu_resource_group) {
++  Embedding<TYPE_2, float>* sparse_embedding =
++      new DressEmbedding<TYPE_2, float>(
++          row_offsets_tensors, value_tensors, embedding_params, gpu_resource_group);
++  return sparse_embedding;
++}
++
++Embedding<EmbeddingCreator::TYPE_1, __half>*
++EmbeddingCreator::create_dress_embedding(
++    const Tensors<TYPE_1>& row_offsets_tensors, const Tensors<TYPE_1>& value_tensors,
++    SparseEmbeddingHashParams<__half> embedding_params,
++    const std::shared_ptr<GPUResourceGroup>& gpu_resource_group) {
++    throw "Unsupported";
++}
++
++Embedding<EmbeddingCreator::TYPE_2, __half>*
++EmbeddingCreator::create_dress_embedding(
++    const Tensors<TYPE_2>& row_offsets_tensors, const Tensors<TYPE_2>& value_tensors,
++    SparseEmbeddingHashParams<__half> embedding_params,
++    const std::shared_ptr<GPUResourceGroup>& gpu_resource_group) {
++    throw "Unsupported";
++}
++
+ Embedding<EmbeddingCreator::TYPE_1, __half>*
+ EmbeddingCreator::create_localized_sparse_embedding_one_hot(
+     const Tensors<TYPE_1>& row_offsets_tensors, const Tensors<TYPE_1>& value_tensors,
+diff --git a/HugeCTR/src/parser.cpp b/HugeCTR/src/parser.cpp
+index f30ce40e..a40edbb4 100644
+--- a/HugeCTR/src/parser.cpp
++++ b/HugeCTR/src/parser.cpp
+@@ -44,6 +44,7 @@
+ #include "HugeCTR/include/regularizers/l1_regularizer.hpp"
+ #include "HugeCTR/include/regularizers/l2_regularizer.hpp"
+ #include "HugeCTR/include/regularizers/no_regularizer.hpp"
++// TODO: Move back
+ 
+ #ifdef ENABLE_MPI
+ #include <mpi.h>
+@@ -243,7 +244,8 @@ const std::map<std::string, Layer_t> LAYER_TYPE_MAP_MP = {
+ const std::map<std::string, Embedding_t> EMBEDDING_TYPE_MAP = {
+     {"DistributedSlotSparseEmbeddingHash", Embedding_t::DistributedSlotSparseEmbeddingHash},
+     {"LocalizedSlotSparseEmbeddingHash", Embedding_t::LocalizedSlotSparseEmbeddingHash},
+-    {"LocalizedSlotSparseEmbeddingOneHot", Embedding_t::LocalizedSlotSparseEmbeddingOneHot}};
++    {"LocalizedSlotSparseEmbeddingOneHot", Embedding_t::LocalizedSlotSparseEmbeddingOneHot},
++    {"Dress", Embedding_t::DressEmbedding}};
+ const std::map<std::string, Initializer_t> INITIALIZER_TYPE_MAP = {
+     {"Uniform", Initializer_t::Uniform},
+     {"XavierNorm", Initializer_t::XavierNorm},
+@@ -1089,6 +1091,25 @@ static void create_embedding(std::map<std::string, SparseInput<TypeKey>>& sparse
+ 
+       break;
+     }
++    case Embedding_t::DressEmbedding: {
++      const SparseEmbeddingHashParams<TypeFP> embedding_params = {
++          batch_size,
++          0,
++          {},
++          embedding_vec_size,
++          sparse_input.max_feature_num_per_sample,
++          sparse_input.slot_num,
++          combiner,  // combiner: 0-sum, 1-mean
++          embedding_opt_params};
++      auto emb_ptr = EmbeddingCreator::create_dress_embedding(
++              sparse_input.row, sparse_input.value, embedding_params,
++              gpu_resource_group);
++      embedding.emplace_back(emb_ptr);
++      embedding_eval.emplace_back(
++              EmbeddingCreator::clone_eval(sparse_input.row_eval, sparse_input.value_eval,
++                  batch_size_eval, gpu_resource_group, emb_ptr));
++      break;
++    }
+   }  // switch
+   for (unsigned int i = 0; i < gpu_resource_group->size(); i++) {
+     tensor_maps[i].emplace(top_name, (embedding.back()->get_output_tensors())[i]);
