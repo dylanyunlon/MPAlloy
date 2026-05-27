@@ -1,5 +1,7 @@
 #include "alloy/tiered_cache.cuh"
 #include "alloy/mixed_precision_kernels.cuh"
+#include "alloy/elastic_migrate.cuh"
+#include "alloy/vectorized_ops.cuh"
 
 #include <dress/embedding.h>
 #include <dress/context.h>
@@ -256,6 +258,113 @@ public:
 
     void set_migration_budget(uint32_t budget) { migration_budget_ = budget; }
 
+    // ── Full training step dispatch ─────────────────────────
+    //
+    // The CUB dispatch_topk equivalent: a single call that runs
+    // the complete multi-phase algorithm in the correct order:
+    //
+    //   Pass 0:  histogram (frequency counting)
+    //   Pass 1:  classify + scatter (three-lambda lookup)
+    //   Pass 2:  gradient scatter-add to tier-local buffers
+    //   Pass 3:  cross-precision allreduce (gather→sum→scatter)
+    //   Pass 4:  SGD update at each tier (TieredSGDKernel)
+    //   Pass 5:  drain previous migration queue (DoubleBuffer flip)
+    //   Pass 6:  checkpoint dirty rows (compact snapshot)
+    //   Pass 7:  verify drift (periodic, every diag_interval steps)
+
+    struct StepResult {
+        float loss;
+        float drift_abs;
+        float drift_rel;
+        uint32_t migrations_processed;
+        uint32_t rows_checkpointed;
+    };
+
+    StepResult train_step(
+        const size_t* d_indices,
+        size_t        batch_size,
+        float*        d_output,
+        float*        d_grad_in,      // [batch_size × dim] — incoming gradients
+        float*        d_grad_accum,   // [num_embeddings × dim] — FP32 accumulator
+        float         learning_rate,
+        cudaStream_t  stream)
+    {
+        StepResult result = {};
+        const size_t N = cfg_.num_embeddings;
+        const size_t D = cfg_.embedding_dim;
+
+        // ── Pass 0+1: lookup (histogram → classify+scatter) ──
+        lookup(d_indices, batch_size, d_output, stream);
+
+        // ── Pass 2: scatter gradients to tier-local buffers ──
+        // (In production, d_grad_in comes from the loss backward pass.
+        //  Here we scatter it to each tier's gradient buffer using the
+        //  same tier assignment that the lookup used.)
+        for (int t = 0; t < 3; ++t)
+            cudaMemsetAsync(d_tier_grads_[t], 0, N * D * sizeof(float), stream);
+
+        auto vlc = VectorizedLaunchConfig::compute(batch_size, D);
+        VectorizedTieredGradScatterKernel<8>
+            <<<vlc.grid, vlc.block, 0, stream>>>(
+            batch_size, D,
+            d_grad_in, d_indices, d_row_tier_,
+            d_tier_grads_[0], d_tier_grads_[1], d_tier_grads_[2]);
+
+        // ── Pass 3: cross-precision allreduce ──
+        allreduce_gradients(d_grad_accum, stream);
+
+        // ── Pass 4: SGD update at each tier ──
+        // Each tier runs TieredSGDKernel on its own rows with its
+        // native learning rate precision.
+        for (int t = 0; t < 3; ++t)
+        {
+            // Count active rows for this tier (rows where d_row_tier == t)
+            // For now, update all rows in the shared buffer — in production,
+            // active_rows is built by a prefix-sum filter on d_row_tier_.
+            const int sgd_grid = static_cast<int>((N + 255) / 256);
+            const float lr = learning_rate;
+            TieredSGDKernel<float, 1><<<sgd_grid, 256, 0, stream>>>(
+                d_tier_bufs_[t],
+                d_tier_grads_[t],
+                lr,
+                nullptr,      // all rows (no filter in demo mode)
+                N,
+                D,
+                d_dirty_flags_);
+        }
+
+        // ── Pass 5: drain previous step's migration queue ──
+        process_migrations(stream);
+
+        // ── Pass 6: checkpoint dirty rows ──
+        cudaMemsetAsync(d_staging_count_, 0, sizeof(uint32_t), stream);
+        const int ckpt_grid = static_cast<int>((N + 255) / 256);
+        CheckpointCompactKernel<float><<<ckpt_grid, 256, 0, stream>>>(
+            d_tier_bufs_[2],   // checkpoint from CPU tier
+            d_dirty_flags_,
+            d_staging_buf_,
+            d_staging_rows_,
+            d_staging_count_,
+            N, D);
+
+        ClearDirtyFlagsKernel<<<ckpt_grid, 256, 0, stream>>>(
+            d_dirty_flags_, N);
+
+        cudaMemcpyAsync(&result.rows_checkpointed, d_staging_count_,
+                        sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+
+        // ── Pass 7: periodic drift verification ──
+        if (cfg_.diag_interval > 0 && (step_ % cfg_.diag_interval) == 0)
+        {
+            auto [abs_d, rel_d] = verify_drift(stream);
+            result.drift_abs = abs_d;
+            result.drift_rel = rel_d;
+        }
+
+        cudaStreamSynchronize(stream);
+        return result;
+    }
+
     // ── Accessors ───────────────────────────────────────────────
 
     uint32_t*  freq_histogram() { return d_freq_hist_; }
@@ -279,6 +388,12 @@ private:
 
     // Migration queue (DoubleBuffer: producer fills Current, consumer drains Alternate)
     MigrationQueueDoubleBuffer mig_queue_ = {};
+
+    // Dirty tracking for incremental checkpoint
+    uint8_t*  d_dirty_flags_    = nullptr;   // [num_embeddings]
+    float*    d_staging_buf_    = nullptr;   // compact checkpoint output
+    size_t*   d_staging_rows_   = nullptr;   // which rows are staged
+    uint32_t* d_staging_count_  = nullptr;   // [1]
 
     // Diagnostic buffers (persistent — no per-call malloc/free)
     float*    d_diag_ref_       = nullptr;
@@ -316,6 +431,13 @@ private:
             cudaMemset(d_tier_grads_[t], 0, N * D * sizeof(float));
         }
 
+        // Dirty tracking + staging for checkpoint
+        cudaMalloc(&d_dirty_flags_,   N * sizeof(uint8_t));
+        cudaMalloc(&d_staging_buf_,   N * D * sizeof(float));
+        cudaMalloc(&d_staging_rows_,  N * sizeof(size_t));
+        cudaMalloc(&d_staging_count_, sizeof(uint32_t));
+        cudaMemset(d_dirty_flags_, 0, N * sizeof(uint8_t));
+
         const size_t diag_sz = 256 * D * sizeof(float);
         cudaMalloc(&d_diag_ref_,     diag_sz);
         cudaMalloc(&d_diag_test_,    diag_sz);
@@ -337,6 +459,10 @@ private:
             cudaFree(d_tier_bufs_[t]);
             cudaFree(d_tier_grads_[t]);
         }
+        cudaFree(d_dirty_flags_);
+        cudaFree(d_staging_buf_);
+        cudaFree(d_staging_rows_);
+        cudaFree(d_staging_count_);
         cudaFree(d_diag_ref_);
         cudaFree(d_diag_test_);
         cudaFree(d_diag_scratch_);
