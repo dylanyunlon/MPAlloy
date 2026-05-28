@@ -52,6 +52,9 @@ class EmbeddingMeta:
     last_access_time: float = 0.0
     cumulative_gradient_norm: float = 0.0
     migration_count: int = 0
+    last_migration_time: float = 0.0  # M008: wall-clock of last tier change
+    pending_target: Optional[Tier] = None  # M007: tier proposed but not yet confirmed
+    pending_streak: int = 0  # M007: consecutive plans agreeing on pending_target
 
 
 class AccessFrequencyTracker:
@@ -97,6 +100,50 @@ class AccessFrequencyTracker:
         else:
             return Tier.CPU_DRAM
 
+    def classify_tier_hysteresis(self, table_id: int, row_idx: int,
+                                 current_tier: Tier,
+                                 hot_threshold: float = 0.3,
+                                 warm_threshold: float = 0.05,
+                                 band: float = 0.2) -> Tier:
+        """
+        M007: Hysteresis-aware classification to prevent hot<->warm ping-pong.
+
+        A row sitting near a boundary (e.g. freq ~0.30 against hot_threshold)
+        would otherwise flip tier every step as EMA jitters by a few percent.
+        We split each boundary into an upper (promote) and lower (demote) edge
+        separated by a dead band. Promotion requires crossing the *higher*
+        edge; demotion requires falling below the *lower* edge. Inside the band
+        the row keeps its current tier, so jitter no longer triggers migration.
+
+        band is the fractional width of the dead zone relative to each
+        threshold (0.2 → ±10% around the nominal threshold).
+        """
+        freq = self.get_frequency(table_id, row_idx)
+
+        hot_up = hot_threshold * (1.0 + band / 2.0)
+        hot_down = hot_threshold * (1.0 - band / 2.0)
+        warm_up = warm_threshold * (1.0 + band / 2.0)
+        warm_down = warm_threshold * (1.0 - band / 2.0)
+
+        # Resolve the "naive" tier the row would want at each edge.
+        if freq >= hot_up:
+            desired = Tier.H100_HBM3
+        elif freq >= warm_up:
+            desired = Tier.A6000_GDDR6
+        else:
+            desired = Tier.CPU_DRAM
+
+        # If the row is already hotter than desired, only demote once it has
+        # truly fallen below the lower edge; otherwise hold (dead band).
+        if current_tier == Tier.H100_HBM3:
+            if freq >= hot_down:
+                return Tier.H100_HBM3
+        elif current_tier == Tier.A6000_GDDR6:
+            if warm_down <= freq < hot_up:
+                return Tier.A6000_GDDR6
+
+        return desired
+
 
 class TieredPlacementScheduler:
     """
@@ -104,13 +151,24 @@ class TieredPlacementScheduler:
     Integrates with HypeReca's embedding storage and mTuner's elastic operations.
     """
     
-    def __init__(self, tier_configs: List[TierConfig]):
+    def __init__(self, tier_configs: List[TierConfig],
+                 migration_cooldown_s: float = 5.0,
+                 confirm_streak: int = 3,
+                 hysteresis_band: float = 0.2):
         self.tiers = {tc.tier: tc for tc in tier_configs}
         self.tracker = AccessFrequencyTracker()
         self.embeddings: Dict[Tuple[int, int], EmbeddingMeta] = {}
         self._tier_usage: Dict[Tier, int] = {t: 0 for t in Tier}
         self._lock = threading.Lock()
         self._migration_log: List[dict] = []
+        # M008: minimum wall-clock seconds a chunk must rest before it may
+        # migrate again. Caps churn at 1/cooldown migrations per chunk.
+        self.migration_cooldown_s = migration_cooldown_s
+        # M007/M009: how many consecutive plans must agree on a new target
+        # before the migration actually fires. Filters transient hotness spikes.
+        self.confirm_streak = max(1, confirm_streak)
+        self.hysteresis_band = hysteresis_band
+        self._suppressed_migrations = 0  # diagnostics: how many we damped
     
     def register_embedding_table(self, table_id: int, num_rows: int,
                                   embedding_dim: int, chunk_size: int = 4096):
@@ -132,27 +190,60 @@ class TieredPlacementScheduler:
         """
         Compute optimal placement plan based on current access frequencies.
         Returns list of (embedding_meta, target_tier) for migrations needed.
+
+        M007: tier selection now uses a hysteresis band so a row hovering near
+              a threshold no longer flips every step.
+        M008: a chunk that migrated within migration_cooldown_s is skipped,
+              capping per-chunk migration rate.
+        M009: a new target must be confirmed by confirm_streak consecutive
+              plans before it fires, filtering transient spikes. Confirmation
+              state lives on the meta so it survives across calls.
         """
+        now = time.time()
         migrations = []
-        
-        for key, meta in self.embeddings.items():
-            # Determine target tier based on frequency
-            target_tier = self.tracker.classify_tier(
-                meta.table_id, meta.row_start
-            )
-            
-            # Check capacity constraints
-            if not self._has_capacity(target_tier, meta):
-                # Fall back to next tier
-                target_tier = Tier(min(target_tier.value + 1, Tier.SSD_ARCHIVE.value))
-            
-            if target_tier != meta.current_tier:
+
+        with self._lock:
+            for key, meta in self.embeddings.items():
+                # M007: hysteresis-aware desired tier.
+                target_tier = self.tracker.classify_tier_hysteresis(
+                    meta.table_id, meta.row_start, meta.current_tier,
+                    band=self.hysteresis_band,
+                )
+
+                # Capacity fallback (unchanged semantics): demote one tier down.
+                if not self._has_capacity(target_tier, meta):
+                    target_tier = Tier(min(target_tier.value + 1,
+                                           Tier.SSD_ARCHIVE.value))
+
+                if target_tier == meta.current_tier:
+                    # Stable: clear any half-built confirmation streak.
+                    meta.pending_target = None
+                    meta.pending_streak = 0
+                    continue
+
+                # M009: require the same target across confirm_streak plans.
+                if meta.pending_target == target_tier:
+                    meta.pending_streak += 1
+                else:
+                    meta.pending_target = target_tier
+                    meta.pending_streak = 1
+
+                if meta.pending_streak < self.confirm_streak:
+                    self._suppressed_migrations += 1
+                    continue
+
+                # M008: cooldown gate — respect minimum rest between moves.
+                if (meta.last_migration_time > 0.0 and
+                        now - meta.last_migration_time < self.migration_cooldown_s):
+                    self._suppressed_migrations += 1
+                    continue
+
                 migrations.append((meta, target_tier))
-        
+
         # Sort migrations: promote hot data first, then demote cold data
         migrations.sort(key=lambda x: (x[1].value, -self.tracker.get_frequency(
             x[0].table_id, x[0].row_start)))
-        
+
         return migrations
     
     def execute_migration(self, meta: EmbeddingMeta, target_tier: Tier,
@@ -179,6 +270,9 @@ class TieredPlacementScheduler:
         with self._lock:
             meta.current_tier = target_tier
             meta.migration_count += 1
+            meta.last_migration_time = time.time()  # M008: start cooldown clock
+            meta.pending_target = None  # M009: streak consumed
+            meta.pending_streak = 0
             self._migration_log.append({
                 'table_id': meta.table_id,
                 'row_range': (meta.row_start, meta.row_end),
@@ -219,6 +313,7 @@ class TieredPlacementScheduler:
         
         return {
             'total_migrations': len(self._migration_log),
+            'suppressed_migrations': self._suppressed_migrations,
             'pcie4_avg_latency_ms': np.mean(pcie4_latencies) if pcie4_latencies else 0,
             'pcie5_avg_latency_ms': np.mean(pcie5_latencies) if pcie5_latencies else 0,
             'pcie4_count': len(pcie4_latencies),
