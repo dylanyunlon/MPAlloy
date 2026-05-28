@@ -67,6 +67,16 @@ class GPUMemoryPool:
                 self.slots.move_to_end(key)
                 return slot
         return None
+
+    def pop(self, table_id: int, row_range: Tuple[int, int]) -> Optional[TensorSlot]:
+        """Atomically get and remove a slot. Prevents TOCTOU race in discard()."""
+        key = (table_id, row_range[0])
+        with self._lock:
+            if key in self.slots:
+                slot = self.slots.pop(key)
+                self.used_bytes -= slot.size_bytes
+                return slot
+        return None
     
     def put(self, slot: TensorSlot) -> List[TensorSlot]:
         """
@@ -77,6 +87,15 @@ class GPUMemoryPool:
         key = (slot.table_id, slot.row_range[0])
         
         with self._lock:
+            # Reject if single slot exceeds total capacity (not threshold)
+            if slot.size_bytes > self.capacity_bytes:
+                logger.warning(
+                    f"Slot table={slot.table_id} rows={slot.row_range} "
+                    f"size={slot.size_bytes} exceeds pool capacity "
+                    f"{self.capacity_bytes}. Rejecting insertion."
+                )
+                return [slot]  # Return the slot itself as "evicted"
+
             # Evict if necessary
             while (self.used_bytes + slot.size_bytes > 
                    self.capacity_bytes * self.eviction_threshold):
@@ -88,6 +107,11 @@ class GPUMemoryPool:
                 evicted.append(lru_slot)
                 logger.debug(f"Evicted table={lru_slot.table_id} "
                            f"rows={lru_slot.row_range} from {self.device}")
+            
+            # Remove existing entry for same key if present (update case)
+            if key in self.slots:
+                old_slot = self.slots.pop(key)
+                self.used_bytes -= old_slot.size_bytes
             
             self.slots[key] = slot
             self.used_bytes += slot.size_bytes
@@ -158,7 +182,10 @@ class ElasticTensorManager:
         start = time.time()
         source = self.pools[source_pool]
         
-        slot = source.get(table_id, row_range)
+        # Atomic pop: get and remove in one lock acquisition.
+        # This prevents TOCTOU race where another thread could evict
+        # the same slot between get() and manual delete.
+        slot = source.pop(table_id, row_range)
         if slot is None:
             return None
         
@@ -179,13 +206,6 @@ class ElasticTensorManager:
             dirty=slot.dirty,
             size_bytes=migrated.numel() * migrated.element_size()
         )
-        
-        # Remove from source
-        with source._lock:
-            key = (table_id, row_range[0])
-            if key in source.slots:
-                del source.slots[key]
-                source.used_bytes -= slot.size_bytes
         
         target.put(new_slot)
         
@@ -262,14 +282,50 @@ class ElasticTensorManager:
             pass
     
     def _get_pool_dtype(self, pool_name: str) -> torch.dtype:
-        """Get the native dtype for a pool."""
-        dtype_map = {
-            'h100': torch.float8_e4m3fn,
-            'a6000_0': torch.bfloat16,
-            'a6000_1': torch.bfloat16,
-            'cpu': torch.float32,
-        }
-        return dtype_map.get(pool_name, torch.float32)
+        """
+        Infer the native dtype for a pool based on its device type and name.
+        
+        Strategy:
+          1. If pool has a real CUDA device, inspect compute capability.
+          2. Otherwise, infer from pool name (supports testing on CPU).
+        
+        This handles arbitrary pool names (e.g., 'a6000_2', 'a6000_3')
+        without manual dict updates.
+        """
+        pool = self.pools.get(pool_name)
+        if pool is None:
+            # Unknown pool — try name-based inference, then default FP32
+            return self._dtype_from_name(pool_name)
+        
+        device = pool.device
+        
+        # For CUDA devices, check capability (authoritative)
+        if device.type == 'cuda':
+            try:
+                cap = torch.cuda.get_device_capability(device)
+                if cap[0] >= 9:  # sm90+ (Hopper): supports FP8
+                    return torch.float8_e4m3fn
+                else:  # sm86 and below: BF16
+                    return torch.bfloat16
+            except Exception:
+                pass
+        
+        # For CPU-device pools OR fallback: use name-based inference.
+        # This is essential for:
+        #   a) Testing without real GPUs (pools created on CPU)
+        #   b) CPU-staged pools that genuinely hold FP32 data
+        return self._dtype_from_name(pool_name)
+    
+    @staticmethod
+    def _dtype_from_name(pool_name: str) -> torch.dtype:
+        """Infer dtype from pool name string. Used as fallback."""
+        if pool_name.startswith('h100') or pool_name.startswith('h200'):
+            return torch.float8_e4m3fn
+        if 'a6000' in pool_name or 'a100' in pool_name or 'gpu' in pool_name:
+            return torch.bfloat16
+        if pool_name == 'cpu' or pool_name.startswith('cpu'):
+            return torch.float32
+        return torch.float32
     
     def get_latency_report(self) -> Dict[str, Dict[str, float]]:
         """Get latency statistics for all operations."""
