@@ -79,24 +79,123 @@ Tier classify_row(float freq, const TierThresholds& th)
 //  pass, following the same decomposition as CUB DeviceTopK:
 //  isolating the histogram pass lets us pick an occupancy-optimal
 //  grid size independently of the filter kernel.
+//
+//  ── Why the naive version was a bottleneck ──────────────────────
+//  Embedding access in DLRM-style workloads is heavily power-law:
+//  a handful of "hot" rows absorb a large fraction of every batch.
+//  A plain `atomicAdd(d_freq_hist + row, 1)` therefore serialises
+//  *every* lane that touched a hot row onto the *same* global
+//  address — within a warp, across a block, and across the grid.
+//  At a 32× collision rate on a hot row the atomic unit, not memory
+//  bandwidth, sets the kernel's runtime.
+//
+//  The rewrite below removes that serialisation in two stages, in
+//  the spirit of CUB's two-level (privatised → global) histogram:
+//
+//    M088  Warp-level aggregation.  Lanes in a warp that target the
+//          *same* row are discovered with __match_any_sync; one
+//          elected leader performs a single atomicAdd carrying the
+//          whole group's count.  A hot row hit by all 32 lanes now
+//          costs 1 atomic instead of 32.
+//
+//    M089  Block-level privatisation (opt-in fast path).  When the
+//          vocabulary is small enough to fit a uint32 slot per row
+//          in shared memory, each block accumulates into a private
+//          shared histogram and flushes it to global once at the
+//          end — converting B global atomics per row into 1 per
+//          block that touched it.  Selected at launch via the
+//          dynamic shared-memory size; falls back to the global
+//          warp-aggregated path (M088) when it would not fit.
+//
+//    M090  Vectorised, grid-stride index loads.  The old kernel
+//          processed exactly grid·block·IPT items and silently
+//          dropped any batch tail beyond that.  The loop below is a
+//          true grid-stride loop (correct for *any* grid size) and
+//          loads four indices per iteration to hide load latency.
 // ─────────────────────────────────────────────────────────────────
+
+// ---- M088 helper: one warp-aggregated increment to a uint32 histogram ----
+//
+//  All *active* lanes call this with their own `slot`.  Lanes sharing
+//  a slot are grouped via __match_any_sync; the lowest lane in each
+//  group adds the group's population in a single atomic.  Works for a
+//  partial warp (uses the real active mask) and for the degenerate
+//  all-distinct case (every group has size 1 → identical to a plain
+//  atomicAdd, no correctness penalty).
+//
+//  Pre-Volta architectures lack __match_any_sync; there we fall back
+//  to a plain atomic so the kernel still compiles and runs correctly.
+__device__ __forceinline__
+void warp_aggregated_inc(uint32_t* __restrict__ hist, uint32_t slot)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    const unsigned active = __activemask();
+    // Mask of lanes (within `active`) whose slot equals ours.
+    const unsigned peers  = __match_any_sync(active, slot);
+    const int      group  = __popc(peers);                 // group size
+    const int      lane   = threadIdx.x & 31;
+    // Elect the lowest set lane in the peer group as the leader.
+    const int      leader = __ffs(peers) - 1;
+    if (lane == leader)
+    {
+        atomicAdd(hist + slot, static_cast<uint32_t>(group));
+    }
+#else
+    atomicAdd(hist + slot, 1u);
+#endif
+}
 
 template <int BLOCK_THREADS = 256, int ITEMS_PER_THREAD = 4>
 __global__ void FrequencyHistogramKernel(
-    const size_t* __restrict__ d_indices,   // [batch_size]
-    uint32_t*     __restrict__ d_freq_hist, // [num_embeddings] — global histogram
-    size_t                     batch_size)
+    const size_t* __restrict__ d_indices,    // [batch_size]
+    uint32_t*     __restrict__ d_freq_hist,  // [num_embeddings] — global histogram
+    size_t                     batch_size,
+    size_t                     num_embeddings = 0)  // needed only for the M089 path
 {
-    const size_t tile_offset = static_cast<size_t>(blockIdx.x) *
-                               BLOCK_THREADS * ITEMS_PER_THREAD;
+    // M089: dynamic shared memory.  Size > 0 ⇒ caller decided the whole
+    // vocabulary fits and wants the block-privatised path.  Size == 0 ⇒
+    // global warp-aggregated path only.
+    extern __shared__ uint32_t s_hist[];
+    const bool use_shared = (num_embeddings > 0);
 
-    #pragma unroll
-    for (int i = 0; i < ITEMS_PER_THREAD; ++i)
+    if (use_shared)
     {
-        const size_t pos = tile_offset + threadIdx.x + i * BLOCK_THREADS;
-        if (pos < batch_size)
+        // Zero the private histogram cooperatively.
+        for (size_t i = threadIdx.x; i < num_embeddings; i += BLOCK_THREADS)
+            s_hist[i] = 0u;
+        __syncthreads();
+    }
+
+    // M090: true grid-stride loop, four indices per step.
+    const size_t stride = static_cast<size_t>(gridDim.x) * BLOCK_THREADS * ITEMS_PER_THREAD;
+    for (size_t base = (static_cast<size_t>(blockIdx.x) * BLOCK_THREADS * ITEMS_PER_THREAD)
+                       + threadIdx.x;
+         base < batch_size + stride;            // +stride so the tail iteration runs
+         base += stride)
+    {
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i)
         {
-            atomicAdd(d_freq_hist + d_indices[pos], 1u);
+            const size_t pos = base + static_cast<size_t>(i) * BLOCK_THREADS;
+            if (pos < batch_size)
+            {
+                const uint32_t slot = static_cast<uint32_t>(d_indices[pos]);
+                if (use_shared)
+                    warp_aggregated_inc(s_hist, slot);       // M088 into shared
+                else
+                    warp_aggregated_inc(d_freq_hist, slot);  // M088 into global
+            }
+        }
+    }
+
+    // M089: flush the block-private histogram to global once.
+    if (use_shared)
+    {
+        __syncthreads();
+        for (size_t i = threadIdx.x; i < num_embeddings; i += BLOCK_THREADS)
+        {
+            const uint32_t c = s_hist[i];
+            if (c != 0u) atomicAdd(d_freq_hist + i, c);
         }
     }
 }
@@ -398,10 +497,19 @@ struct TieredCacheLaunchConfig {
     int migrate_grid_size;
     int migrate_block_size;
 
+    // M089: shared-memory histogram path. histogram_shmem_bytes > 0 means
+    // the whole vocabulary fits in one block's shared memory, so the
+    // privatised path should be launched with this dynamic shmem size and
+    // num_embeddings passed to the kernel. 0 means use the global
+    // warp-aggregated path (kernel's num_embeddings arg stays 0).
+    size_t histogram_shmem_bytes;
+    bool   histogram_use_shared;
+
     static TieredCacheLaunchConfig compute(
         size_t batch_size,
         size_t num_embeddings,
-        int    sm_count)
+        int    sm_count,
+        size_t max_shmem_per_block = 48u * 1024u)  // conservative default (48 KB)
     {
         constexpr int HIST_BLOCK  = 256;
         constexpr int HIST_IPT    = 4;
@@ -415,6 +523,28 @@ struct TieredCacheLaunchConfig {
         // Cap at 4× SM occupancy
         if (cfg.histogram_grid_size > sm_count * 4)
             cfg.histogram_grid_size = sm_count * 4;
+        if (cfg.histogram_grid_size < 1)
+            cfg.histogram_grid_size = 1;
+
+        // M089: pick the privatised path only when a uint32 slot per row
+        // fits in shared memory. Above that we'd thrash, so use the global
+        // warp-aggregated path (M088) instead.
+        const size_t needed = num_embeddings * sizeof(uint32_t);
+        if (num_embeddings > 0 && needed <= max_shmem_per_block)
+        {
+            cfg.histogram_use_shared  = true;
+            cfg.histogram_shmem_bytes = needed;
+            // With privatisation, more blocks only add flush traffic; cap
+            // the grid so each block still sees a meaningful slice of input.
+            const int by_occupancy = sm_count * 2;
+            if (by_occupancy > 0 && cfg.histogram_grid_size > by_occupancy)
+                cfg.histogram_grid_size = by_occupancy;
+        }
+        else
+        {
+            cfg.histogram_use_shared  = false;
+            cfg.histogram_shmem_bytes = 0;
+        }
 
         cfg.classify_block_size = CLASS_BLOCK;
         cfg.classify_grid_size  = static_cast<int>(

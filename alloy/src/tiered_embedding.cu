@@ -103,12 +103,28 @@ public:
             cfg_.ema_decay,
             cfg_.num_embeddings);
 
-        // Pass 0: histogram-only (isolated kernel — own occupancy sweet spot)
-        FrequencyHistogramKernel<256, 4>
-            <<<lc.histogram_grid_size, lc.histogram_block_size, 0, stream>>>(
-            d_indices,
-            d_freq_hist_,
-            batch_size);
+        // Pass 0: histogram-only (isolated kernel — own occupancy sweet spot).
+        // M088/M089: warp-aggregated atomics, with a block-privatised shared
+        // path selected by the launch config when the vocabulary fits.
+        if (lc.histogram_use_shared)
+        {
+            FrequencyHistogramKernel<256, 4>
+                <<<lc.histogram_grid_size, lc.histogram_block_size,
+                   lc.histogram_shmem_bytes, stream>>>(
+                d_indices,
+                d_freq_hist_,
+                batch_size,
+                cfg_.num_embeddings);
+        }
+        else
+        {
+            FrequencyHistogramKernel<256, 4>
+                <<<lc.histogram_grid_size, lc.histogram_block_size, 0, stream>>>(
+                d_indices,
+                d_freq_hist_,
+                batch_size,
+                0);  // global warp-aggregated path
+        }
 
         // Reset current migration counter (DoubleBuffer.Current())
         cudaMemsetAsync(mig_queue_.CurrentCount(), 0, sizeof(uint32_t), stream);
