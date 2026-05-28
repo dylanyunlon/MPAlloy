@@ -47,29 +47,69 @@ class CrossPrecisionAllReduce:
     def allreduce_gradients(
         self, 
         gradients: Dict[torch.device, torch.Tensor],
-        reference_device: Optional[torch.device] = None
+        reference_device: Optional[torch.device] = None,
+        row_counts: Optional[Dict[torch.device, int]] = None,
     ) -> Dict[torch.device, torch.Tensor]:
         """
         Perform cross-precision gradient allreduce.
-        1. Upcast all gradients to FP32
-        2. Sum and average
-        3. Downcast back to each device's native precision
+        
+        M004: Weighted average by tier row count instead of simple mean.
+        H100 may hold fewer rows (hot tier) than A6000s (warm tier),
+        so each device's gradient contribution should be proportional
+        to the number of rows it actually trained on.
+        
+        M005: NaN/Inf sentinel — detect poisoned gradients before they
+        propagate through the allreduce and corrupt all devices.
         """
-        # Step 1: Collect all gradients in FP32 on CPU
+        # M005: NaN/Inf sentinel detection
+        nan_inf_report = {}
+        for device, grad in gradients.items():
+            config = self.configs[device]
+            has_nan = bool(torch.isnan(grad).any().item())
+            has_inf = bool(torch.isinf(grad).any().item())
+            if has_nan or has_inf:
+                nan_inf_report[config.device_name] = {
+                    'has_nan': has_nan, 'has_inf': has_inf,
+                    'nan_count': int(torch.isnan(grad).sum().item()),
+                    'inf_count': int(torch.isinf(grad).sum().item()),
+                }
+                logger.warning(
+                    f"NaN/Inf detected in gradient from {config.device_name}: "
+                    f"nan={has_nan}, inf={has_inf}. Zeroing poisoned elements.")
+        
+        # Step 1: Collect all gradients in FP32 on CPU, sanitize NaN/Inf
         fp32_grads = []
+        weights = []
         for device, grad in gradients.items():
             fp32_grad = grad.detach().float().cpu()
+            # M005: Replace NaN/Inf with zero to prevent propagation
+            fp32_grad = torch.where(
+                torch.isfinite(fp32_grad), fp32_grad, torch.zeros_like(fp32_grad))
             fp32_grads.append(fp32_grad)
+            # M004: Weight by row count (default 1 if not provided)
+            if row_counts and device in row_counts:
+                weights.append(float(row_counts[device]))
+            else:
+                weights.append(1.0)
         
-        # Step 2: Compute mean in FP32
-        stacked = torch.stack(fp32_grads)
-        mean_grad = stacked.mean(dim=0)
+        # M004: Weighted average instead of simple mean
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            total_weight = float(len(weights))
+            weights = [1.0] * len(weights)
+        
+        weighted_sum = torch.zeros_like(fp32_grads[0])
+        for grad, w in zip(fp32_grads, weights):
+            weighted_sum += grad * (w / total_weight)
+        
+        # Store sentinel report for diagnostics
+        self._last_nan_inf_report = nan_inf_report
         
         # Step 3: Distribute back in native precision
         result = {}
         for device, grad in gradients.items():
             config = self.configs[device]
-            result[device] = mean_grad.to(
+            result[device] = weighted_sum.to(
                 device=device,
                 dtype=config.compute_dtype
             )
@@ -82,12 +122,30 @@ class CrossPrecisionAllReduce:
     ) -> Dict[str, float]:
         """
         Compute numerical drift between precision paths.
-        Returns max absolute and relative errors between each pair.
+        
+        M006: In addition to observed max abs/rel errors, compute a
+        theoretical error bound based on the precision chain.
+        
+        For a value x passing through precision chain FP8→FP32→BF16:
+          - FP8 E4M3: machine epsilon = 2^-3 = 0.125
+          - BF16:     machine epsilon = 2^-7 ≈ 0.0078125
+          - FP32:     machine epsilon = 2^-23 ≈ 1.19e-7
+        
+        The expected ULP bound for a single upcast-downcast round-trip is:
+          err ≤ |x| * (eps_source + eps_target)
         """
         fp32_grads = {}
         for device, grad in gradients.items():
             config = self.configs[device]
             fp32_grads[config.device_name] = grad.detach().float().cpu()
+        
+        # M006: Machine epsilon per dtype
+        eps_table = {
+            torch.float8_e4m3fn: 2**-3,    # 0.125
+            torch.bfloat16:      2**-7,     # 0.0078125
+            torch.float16:       2**-10,    # 0.0009766
+            torch.float32:       2**-23,    # 1.192e-7
+        }
         
         drift_report = {}
         names = list(fp32_grads.keys())
@@ -99,6 +157,29 @@ class CrossPrecisionAllReduce:
                 key = f"{names[i]}_vs_{names[j]}"
                 drift_report[f"{key}_abs"] = abs_err
                 drift_report[f"{key}_rel"] = rel_err
+                
+                # M006: Theoretical error bound
+                dev_i = [d for d, c in self.configs.items() 
+                         if c.device_name == names[i]]
+                dev_j = [d for d, c in self.configs.items() 
+                         if c.device_name == names[j]]
+                if dev_i and dev_j:
+                    eps_i = eps_table.get(self.configs[dev_i[0]].compute_dtype, 2**-23)
+                    eps_j = eps_table.get(self.configs[dev_j[0]].compute_dtype, 2**-23)
+                    # Round-trip bound: upcast to FP32 + downcast introduces
+                    # at most eps_source + eps_target relative error per element
+                    max_magnitude = max(a.abs().max().item(), b.abs().max().item())
+                    theoretical_bound = max_magnitude * (eps_i + eps_j)
+                    drift_report[f"{key}_theoretical_bound"] = theoretical_bound
+                    drift_report[f"{key}_bound_exceeded"] = abs_err > theoretical_bound
+                    # How many ULPs off (relative to the coarser precision)
+                    coarser_eps = max(eps_i, eps_j)
+                    if coarser_eps > 0 and max_magnitude > 0:
+                        drift_report[f"{key}_ulp_distance"] = abs_err / (max_magnitude * coarser_eps)
+        
+        # Track drift over time
+        max_rel = max((v for k, v in drift_report.items() if k.endswith('_rel')), default=0.0)
+        self._drift_history.append(max_rel)
         
         return drift_report
 
@@ -126,6 +207,7 @@ class FPRevDiagnosticBatch:
         - 'boundary': Values near precision boundaries (e.g., FP8 max/min)
         - 'cancellation': Values that cause catastrophic cancellation
         - 'accumulation': Long reduction chains that amplify rounding
+        - 'nan_inf': M005 — Inject NaN/Inf sentinels to verify sanitization
         """
         inputs = {}
         
@@ -156,6 +238,20 @@ class FPRevDiagnosticBatch:
             )
             inputs['indices'] = torch.arange(batch_size)  # Sequential for ordered reduction
         
+        elif strategy == "nan_inf":
+            # M005: Inject NaN and Inf to verify sentinel detection
+            normal = torch.randn(batch_size, self.embedding_dim)
+            # Inject NaN at 5% of positions
+            nan_mask = torch.rand(batch_size, self.embedding_dim) < 0.05
+            normal[nan_mask] = float('nan')
+            # Inject Inf at 2% of positions
+            inf_mask = torch.rand(batch_size, self.embedding_dim) < 0.02
+            normal[inf_mask] = float('inf')
+            inputs['gradients'] = normal
+            inputs['indices'] = torch.randint(0, 1000, (batch_size,))
+            inputs['expected_nan_count'] = int(nan_mask.sum().item())
+            inputs['expected_inf_count'] = int(inf_mask.sum().item())
+        
         return inputs
     
     def verify_consistency(
@@ -168,7 +264,7 @@ class FPRevDiagnosticBatch:
         Run periodic diagnostic verification.
         Returns (is_consistent, detailed_report).
         """
-        strategies = ["boundary", "cancellation", "accumulation"]
+        strategies = ["boundary", "cancellation", "accumulation", "nan_inf"]
         all_drifts = []
         
         for i in range(num_diagnostic_batches):
