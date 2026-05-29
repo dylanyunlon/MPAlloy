@@ -178,43 +178,78 @@ class ElasticTensorManager:
         """
         Discard operation: migrate embedding to a slower tier.
         Handles dtype upcast (FP8→BF16→FP32) to preserve precision.
+
+        Durability (R1 fix): the migration is two-phase. We first stage the
+        upcast copy and attempt to insert it into the target tier. Only if the
+        target *durably accepts* it do we release the source slot. If the
+        target rejects (e.g. the chunk exceeds the target pool's capacity), we
+        roll the source back so the embedding is never lost from both tiers.
+
+        The previous implementation popped the source first; a target
+        rejection then destroyed the only copy and desynced used_bytes. This
+        mirrors the write-ahead / two-phase-commit discipline DeepSpeed uses in
+        swap_out_partitioned_params and that databases use for durable moves.
         """
         start = time.time()
         source = self.pools[source_pool]
-        
-        # Atomic pop: get and remove in one lock acquisition.
-        # This prevents TOCTOU race where another thread could evict
-        # the same slot between get() and manual delete.
+
+        # Phase 0 — read the source slot WITHOUT removing it yet. We use
+        # pop() to take ownership atomically (closing the TOCTOU race from
+        # M001) but keep a reference so we can reinstate it on failure.
         slot = source.pop(table_id, row_range)
         if slot is None:
             return None
-        
-        target = self.pools[target_pool]
-        target_dtype = self._get_pool_dtype(target_pool)
-        
-        # Upcast to preserve precision when moving to slower tier
-        migrated = slot.data.to(device=target.device, dtype=target_dtype)
-        
-        new_slot = TensorSlot(
-            table_id=table_id,
-            row_range=row_range,
-            data=migrated,
-            dtype=target_dtype,
-            device=target.device,
-            last_access=slot.last_access,
-            access_count=slot.access_count,
-            dirty=slot.dirty,
-            size_bytes=migrated.numel() * migrated.element_size()
-        )
-        
-        target.put(new_slot)
-        
+
+        try:
+            target = self.pools[target_pool]
+            target_dtype = self._get_pool_dtype(target_pool)
+
+            # Phase 1 — stage the upcast copy.
+            migrated = slot.data.to(device=target.device, dtype=target_dtype)
+            new_slot = TensorSlot(
+                table_id=table_id,
+                row_range=row_range,
+                data=migrated,
+                dtype=target_dtype,
+                device=target.device,
+                last_access=slot.last_access,
+                access_count=slot.access_count,
+                dirty=slot.dirty,
+                size_bytes=migrated.numel() * migrated.element_size()
+            )
+
+            # Phase 2 — commit to target. put() signals rejection by
+            # returning the very slot we tried to insert (oversized vs the
+            # target's total capacity).
+            evicted = target.put(new_slot)
+            rejected = any(e is new_slot for e in evicted)
+            if rejected:
+                # Roll the source back: the embedding stays where it was.
+                source.put(slot)
+                logger.error(
+                    f"DISCARD rejected by target {target_pool} "
+                    f"(chunk too large); rolled back to {source_pool}. "
+                    f"table={table_id} rows={row_range}")
+                return None
+
+            # Target accepted other evictions (LRU victims) — cascade them.
+            for ev in evicted:
+                self._auto_discard(ev, target_pool)
+        except Exception:
+            # Any staging/commit failure: reinstate the source slot so data
+            # is never silently lost, then re-raise for the caller to handle.
+            source.put(slot)
+            logger.exception(
+                f"DISCARD failed mid-flight; rolled back to {source_pool}. "
+                f"table={table_id} rows={row_range}")
+            raise
+
         elapsed = time.time() - start
         self.op_latencies[ElasticOp.DISCARD].append(elapsed)
-        
+
         logger.info(f"DISCARD table={table_id} {source_pool}→{target_pool} "
                     f"latency={elapsed*1000:.2f}ms")
-        
+
         return new_slot
     
     def execute(self, table_id: int, row_range: Tuple[int, int],

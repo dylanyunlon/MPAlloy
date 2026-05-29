@@ -42,6 +42,22 @@ class CrossPrecisionAllReduce:
     
     def __init__(self, precision_configs: List[PrecisionConfig]):
         self.configs = {pc.device: pc for pc in precision_configs}
+        # The dict is keyed by torch.device, so two tiers that happen to share
+        # a device (e.g. two CPU-staged tiers in a test, or a misconfiguration
+        # putting two logical tiers on cuda:0) silently collapse into one
+        # entry. On real hardware the tiers map to distinct devices
+        # (H100=cuda:0, A6000=cuda:1/2, CPU=cpu) so this is benign, but we
+        # surface it rather than let it hide a config error.
+        if len(self.configs) != len(precision_configs):
+            seen = {}
+            for pc in precision_configs:
+                seen.setdefault(pc.device, []).append(pc.device_name)
+            collapsed = {str(d): n for d, n in seen.items() if len(n) > 1}
+            logger.warning(
+                "CrossPrecisionAllReduce: %d precision configs collapsed to %d "
+                "device keys; tiers sharing a device: %s. Cross-precision drift "
+                "between collapsed tiers cannot be measured.",
+                len(precision_configs), len(self.configs), collapsed)
         self._drift_history: List[float] = []
     
     def allreduce_gradients(
@@ -273,10 +289,35 @@ class FPRevDiagnosticBatch:
             drift = allreduce_fn(inputs)
             all_drifts.append(drift)
         
-        # Aggregate drift statistics
-        max_drift = max(
-            max(d.values()) for d in all_drifts if d
-        ) if all_drifts else 0.0
+        # Aggregate drift statistics.
+        #
+        # R7: a drift report mixes numeric magnitudes (..._abs, ..._rel,
+        # ..._theoretical_bound, ..._ulp_distance) with *boolean* flags
+        # (..._bound_exceeded). A naive max(d.values()) lets a True (== 1.0)
+        # dominate the maximum, so the consistency verdict would flip on a
+        # boolean flag rather than an observed drift magnitude — firing false
+        # "drift detected" alarms. We consider only the relative-drift
+        # magnitudes, which is what max_relative_drift is actually compared to.
+        #
+        # R6: with a single-device (or single-tier) config there are no device
+        # pairs, so the report is empty and max() over nothing raises. We
+        # default to 0.0 (no measurable drift) in that case.
+        def _numeric_drifts(d: Dict) -> List[float]:
+            out = []
+            for k, v in d.items():
+                if not k.endswith('_rel'):
+                    continue
+                if isinstance(v, bool):  # bool is a subclass of int — exclude
+                    continue
+                if isinstance(v, (int, float)):
+                    out.append(float(v))
+            return out
+
+        per_batch_max = []
+        for d in all_drifts:
+            vals = _numeric_drifts(d) if d else []
+            per_batch_max.append(max(vals) if vals else 0.0)
+        max_drift = max(per_batch_max) if per_batch_max else 0.0
         
         is_consistent = max_drift <= max_relative_drift
         

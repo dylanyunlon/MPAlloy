@@ -214,18 +214,31 @@ __global__ void FrequencyDecayKernel(
     float                  decay_factor,
     size_t                 num_embeddings)
 {
-    // We decay in-place using integer multiply-shift:
-    //   new = (old * decay_num) >> decay_shift
-    // For decay_factor ≈ 0.95 we use (243, 8) → 243/256 ≈ 0.9492
-    const uint32_t decay_num   = static_cast<uint32_t>(decay_factor * 256.0f);
-    const uint32_t decay_shift = 8u;
+    // C2 fix: the previous decay used an 8-bit fraction with truncation
+    //   new = (old * round(decay*256)) >> 8
+    // which (a) systematically biased every count downward by up to ~0.5 per
+    // step (floor) and (b) snapped a count of 1 straight to 0 in a single
+    // step — so a genuinely hot row that missed one batch lost ALL of its
+    // accumulated history, defeating the EMA's purpose and destabilising the
+    // downstream hysteresis logic.
+    //
+    // We now use a 16-bit fraction with round-to-nearest:
+    //   new = (old * round(decay*65536) + 32768) >> 16
+    // The wider fraction makes the effective decay match decay_factor far
+    // more closely, and the +half rounding removes the downward bias. A count
+    // of 1 with decay 0.95 now rounds to 1 (0.95 → nearest int 1) rather than
+    // collapsing to 0, preserving hot-row history across an occasional miss.
+    const uint32_t decay_num = static_cast<uint32_t>(decay_factor * 65536.0f + 0.5f);
+    const uint32_t decay_shift = 16u;
+    const uint32_t half = 1u << (decay_shift - 1);
 
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x;
          i < num_embeddings;
          i += gridDim.x * static_cast<size_t>(blockDim.x))
     {
-        const uint32_t old_val = d_freq_hist[i];
-        d_freq_hist[i] = (old_val * decay_num) >> decay_shift;
+        const uint64_t old_val = d_freq_hist[i];
+        d_freq_hist[i] = static_cast<uint32_t>(
+            (old_val * decay_num + half) >> decay_shift);
     }
 }
 
@@ -331,8 +344,19 @@ __global__ void ClassifyAndScatterKernel(
     DataType*           __restrict__ d_output,
     MigrationEntry*     __restrict__ d_migration_queue,
     uint32_t*           __restrict__ d_migration_count,
-    uint32_t                         migration_budget)
+    uint32_t                         migration_budget,
+    float                            freq_norm = 1.0f)
 {
+    // C3 fix: d_freq_hist holds raw access *counts*, but TierThresholds are
+    // expressed as normalized EMA frequencies in [0,1] (matching the Python
+    // AccessFrequencyTracker). Dividing the count by freq_norm (the relevant
+    // access total, e.g. the running window count or batch_size) converts the
+    // count into the same [0,1] space the thresholds live in. Without this,
+    // every row with count>=1 yields freq>=1.0 >= hot_threshold and is
+    // misclassified as hot, making the thresholds — and the whole tiering —
+    // inoperative. inv_norm avoids a per-row divide.
+    const float inv_norm = (freq_norm > 0.0f) ? (1.0f / freq_norm) : 1.0f;
+
     const size_t tile_offset = static_cast<size_t>(blockIdx.x) * BLOCK_THREADS;
 
     // Shared gather helper: copy one embedding row from src tier to output
@@ -356,7 +380,7 @@ __global__ void ClassifyAndScatterKernel(
     // Serve from current tier AND enqueue migration.
     // Analogous to CUB f_with_out_buf: filter + write candidates + histogram.
     auto f_serve_enqueue = [&](size_t row, size_t out_idx) {
-        const float freq    = static_cast<float>(d_freq_hist[row]);
+        const float freq    = static_cast<float>(d_freq_hist[row]) * inv_norm;
         const Tier  target  = classify_row(freq, thresholds);
         const Tier  current = static_cast<Tier>(d_row_tier[row]);
         gather_row(row, out_idx, current);

@@ -133,6 +133,15 @@ public:
         TierThresholds th{cfg_.hot_threshold, cfg_.warm_threshold};
         TierBufferTable<float> read_bufs = {{d_tier_bufs_[0], d_tier_bufs_[1], d_tier_bufs_[2]}};
 
+        // C3: normalize raw access counts into the [0,1] space the thresholds
+        // live in. We use batch_size as the normalizer, so hot_threshold is
+        // interpreted as "fraction of this batch's lookups that referenced the
+        // row." This makes the CUDA classifier consistent with the normalized
+        // EMA frequencies used by the Python AccessFrequencyTracker, instead
+        // of comparing a raw integer count against a [0,1] threshold.
+        const float freq_norm = (batch_size > 0)
+            ? static_cast<float>(batch_size) : 1.0f;
+
         ClassifyAndScatterKernel<float, 256>
             <<<lc.classify_grid_size, lc.classify_block_size, 0, stream>>>(
             d_indices,
@@ -145,7 +154,8 @@ public:
             d_output,
             mig_queue_.Current(),
             mig_queue_.CurrentCount(),
-            migration_budget_);
+            migration_budget_,
+            freq_norm);
 
         ++step_;
     }
